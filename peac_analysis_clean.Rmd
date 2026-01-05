@@ -1,0 +1,293 @@
+---
+title: "peac_analysis_clean"
+author: "Viktor"
+date: "2026-01-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, warning=FALSE, message=FALSE, error=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lme4)
+library(car)
+library(rstatix)
+library(gt)
+library(ggeffects)
+library(afex)
+library(simr)
+```
+
+```{r load data, warning=FALSE, message=FALSE, error=FALSE}
+#specifies data path
+data_path <- "data"
+#makes list of files
+data_list <- list.files(data_path,full.names = TRUE)
+#reads all csv files in list
+read_files <- lapply(data_list,read_csv)
+#binds into single df
+df <- bind_rows(read_files)
+```
+
+```{r pre-processing}
+#adding categories for analysis
+df <- df %>% mutate(
+  #adds categories for garden path type with ifelse commands
+  garden_path_type = 
+    ifelse(grepl("syntactic", sentence_type), "syntactic", 
+           ifelse(grepl("semantic", sentence_type), "semantic", "non_garden_path")),
+  #adds categories for garden path condition with ifelse commands
+  garden_path_cond = ifelse(grepl("unexpected", sentence_type), "unexpected", ifelse(grepl("expected", sentence_type), "expected", "non_garden_path")),
+  #sets reading time in milliseconds
+  reading_time = reading_time*1000,
+  #adds log-transformed reading time for analysis
+  logrt = log10(reading_time),
+  #adds a music criterion for MSI scores. Right now it's quite limited so it's going to correlate STRONGLY with participants, which is why I can't use it for analysis
+  music_criterion = ifelse(Gold_MSI_index > 75, "high_MSI",
+                           ifelse(Gold_MSI_index > 50, "mid_MSI", "low_MSI")))
+
+
+#changes variable types to factors
+df$participant_id = as.factor(df$participant_id)
+df$correct = as.factor(df$correct)
+df$segment_category = as.factor(df$segment_category)
+df$sentence_number = as.factor(df$sentence_number)
+df$sentence_type = as.factor(df$sentence_type)
+df$music_condition = as.factor(df$music_condition)
+df$music_criterion = as.factor(df$music_criterion)
+df$garden_path_cond = as.factor(df$garden_path_cond)
+df$garden_path_type = as.factor(df$garden_path_type)
+
+
+#removes outliers
+df <- df %>% group_by(participant_id) %>%
+  #adds mean and standard deviation (SD) by participant
+  mutate(mean_rt = mean(reading_time),
+         sd_rt = sd(reading_time)) %>%
+  ungroup() %>%
+  #removes all data where reading time is 2.5 SDs above or below participant mean reading time
+  filter(abs(mean_rt - reading_time) < (2.5*sd_rt),
+         #removes all data where reading time is lower than 50 ms
+         reading_time > 50,
+         #or higher than 2500 ms
+         reading_time < 2500)
+
+#centers characters and Gold_MSI index scores
+df$Gold_MSI_index <- scale(df$Gold_MSI_index)
+df$characters <- scale(df$characters)
+
+
+#creating separate datasets for the three critical segment types
+df_gard <- df %>% filter(garden_path_cond != "non_garden_path")
+
+df_pre <- df_gard %>% filter(segment_category == "pre_critical") %>% droplevels()
+df_crit <- df_gard %>% filter(segment_category == "critical") %>% droplevels()
+df_post <- df_gard %>% filter(segment_category == "post_critical") %>% droplevels()
+```
+
+
+```{r power analysis, warning=FALSE, message=FALSE, error=FALSE}
+#power analysis of three-way interaction model for the critical segment
+
+#full model with explicit interactions
+threeway_model_full <- lmer(logrt ~ characters + 
+                   music_condition + garden_path_cond + garden_path_type +
+                   music_condition:garden_path_cond:garden_path_type + 
+                   (1 | participant_id), data = df_crit)
+#null model to compare
+threeway_model_null <- lmer(logrt ~ characters + 
+                   music_condition + garden_path_cond + garden_path_type +
+                   (1 | participant_id), data = df_crit)
+
+#setting effect size to a conversative 5%
+fixef(threeway_model_full)["music_conditionin_key:garden_path_condexpected:garden_path_typesyntactic"] <- 0.05
+
+#extending number of participants to see how many it would take
+threeway_model_full_extend <- extend(threeway_model_full, along = "participant_id", n = 80)
+
+#Shows power at 80 participants
+threeway_powersim <- powerSim(threeway_model_full, 
+                      test = compare(threeway_model_null), 
+                      nsim = 1000)
+
+#makes power curve showing increase of power as a function of increase in samples/subjects
+threeway_pc <- powerCurve(threeway_model_full_extend,
+                 test=compare(threeway_model_null),
+                 along = "participant_id",
+                 nsim = 100)
+#plots power curve for three-way interaction model
+plot(threeway_pc)
+summary(threeway_pc)
+```
+
+
+```{r lme models}
+#pre-critical segment model
+pre_model <- lmer(logrt ~ 
+             music_condition * garden_path_cond * garden_path_type + characters +
+             (1|participant_id),
+           data = df_pre)
+#critical segment model
+crit_model <- lmer(logrt ~ characters + 
+             music_condition * garden_path_cond * garden_path_type + characters + 
+             (1|participant_id),
+           data = df_crit)
+#post-critical segment model
+post_model <- lmer(logrt ~ 
+             music_condition * garden_path_cond * garden_path_type + characters + 
+             (1|participant_id),
+           data = df_post)
+```
+
+```{r assumptions}
+#function to run on all three model datasets
+plot_assumption_tests <- function(model)
+{
+  #makes dataframe of predicted values and residuals
+  assumption_df <- data.frame(predictions=predict(model),residual=residuals(model))
+  
+  #plots residuals and predicted values to evaluate homoscedasticity
+  scedast_plot <- ggplot(assumption_df,
+         aes(x=predictions,y=residual)) +
+    geom_point() + geom_hline(yintercept=0, lty=3)
+  
+  #plots histogram of residuals to evaluate normality
+  hist_plot <- ggplot(assumption_df,aes(x=residual)) +
+    geom_histogram(bins=20)
+  
+  #plots qqplot to evaluate normality
+  qq_plot <- ggplot(assumption_df,aes(sample=residual)) +
+    stat_qq() + stat_qq_line()
+ 
+  print(scedast_plot)
+  print(hist_plot)
+  print(qq_plot)
+}
+
+plot_assumption_tests(pre_model)
+plot_assumption_tests(crit_model)
+plot_assumption_tests(post_model)
+```
+
+```{r summary and plotting cross-segment}
+#summary dataframe
+df_sum <- df_gard %>% filter(segment_category != "non_critical") %>%
+  group_by(garden_path_cond,garden_path_type,segment_category,music_condition) %>%
+  summarise(rt = mean(reading_time), sd = sd(reading_time), n = n(), se = sd/sqrt(n)) %>% droplevels()
+
+#makes seperate dataframes for syntactic and semantic garden path sentences
+df_syn <- df_gard %>% filter(garden_path_type == "syntactic", segment_category != "non_critical") %>% droplevels()
+df_sem <- df_gard %>% filter(garden_path_type == "semantic", segment_category != "non_critical") %>% droplevels()
+
+#orders factor levels properly
+df_syn$segment_category = relevel(df_syn$segment_category, "post_critical")
+df_syn$segment_category = relevel(df_syn$segment_category, "critical")
+df_syn$segment_category = relevel(df_syn$segment_category, "pre_critical")
+#for the semantic dataset
+df_sem$segment_category = relevel(df_sem$segment_category, "post_critical")
+df_sem$segment_category = relevel(df_sem$segment_category, "critical")
+df_sem$segment_category = relevel(df_sem$segment_category, "pre_critical")
+
+#makes plot for semantic garden paths
+sem_segment_plot <- ggplot(df_sem, aes(x = segment_category, color = music_condition, group = music_condition, y = reading_time)) + 
+  stat_summary(fun = mean, geom = "point") +
+  stat_summary(fun = mean, geom = "line") + 
+  labs(title = "Mean reading time (ms) for semantic garden path sentences", x = "Segment category", y = "Reading time (ms)") +
+  facet_wrap(~garden_path_cond)
+
+#makes plot for syntactic garden paths
+syn_segment_plot <- ggplot(df_syn, aes(x = segment_category, color = music_condition, group = music_condition, y = reading_time)) + 
+  stat_summary(fun = mean, geom = "point") +
+  stat_summary(fun = mean, geom = "line") +
+  labs(title = "Mean reading time (ms) for syntactic garden path sentences", x = "Segment category", y = "Reading time (ms)") +
+  facet_wrap(~garden_path_cond)
+
+plot(syn_segment_plot)
+plot(sem_segment_plot)
+```
+
+
+```{r plotting effects}
+pre_model_nolog <-
+  lmer(reading_time ~ characters + music_condition * garden_path_cond * garden_path_type +
+         (1|participant_id), data = df_pre)
+
+crit_model_nolog <-
+  lmer(reading_time ~ characters + music_condition * garden_path_cond * garden_path_type +
+         (1|participant_id), data = df_crit)
+
+post_model_nolog <-
+  lmer(reading_time ~ characters + music_condition * garden_path_cond * garden_path_type + 
+         (1|participant_id), data = df_post)
+
+#plot details
+#pre-critical
+pre_eff_plot <- ggpredict(pre_model_nolog, c("garden_path_type","music_condition","garden_path_cond"))
+#critical
+crit_eff_plot <- ggpredict(crit_model_nolog, c("garden_path_type","music_condition","garden_path_cond"))
+#post-critical
+post_eff_plot <- ggpredict(post_model, c("garden_path_type","music_condition","garden_path_cond"))
+
+#pre-critical segment plot
+pre_crit_segplot <- plot(pre_eff_plot) + labs(
+  title = "Reading time for pre-critical segments",
+  subtitle = "Musical condition",
+  y = "Reading time (ms)",
+  x = "Characters (scaled and 0-centered around the mean)",
+  color = "Garden path type"
+)
+
+#critical segment plot
+crit_segplot <- plot(crit_eff_plot) + labs(
+  title = "Reading time for critical segments",
+  subtitle = "Musical condition",
+  y = "Reading time (log-transformed)",
+  x = "Characters (scaled and 0-centered around the mean)",
+  color = "Garden path type"
+)
+
+#post-critical segment plot
+post_crit_segplot <- plot(post_eff_plot) + labs(
+  title = "Reading time for post-critical segments",
+  subtitle = "Musical condition",
+  y = "Reading time (log-transformed)",
+  x = "Characters (scaled and 0-centered around the mean)",
+  color = "Garden path type"
+)
+
+#unique post semantic analysis
+df_post_sem_analysis <- df_post %>% filter(garden_path_type == "semantic")
+
+post_sem_model <- 
+  mixed(logrt ~ characters + music_condition * garden_path_cond + (1|participant_id), data = df_post_sem_analysis, method = "KR")
+
+#unique crit/post syntax analysis
+df_crit_post_syn_anal <- bind_rows(df_crit,df_post) %>% filter(garden_path_type == "syntactic") %>% droplevels()
+
+crit_post_model <- 
+  mixed(logrt ~ characters + music_condition * garden_path_cond + (1|participant_id), data = df_crit_post_syn_anal, method = "KR")
+```
+
+```{r F-tests}
+af_pre_model <-
+  mixed(logrt ~ characters + music_condition * garden_path_cond * garden_path_type + 
+          (1|participant_id), df_pre, method = "KR")
+af_crit_model <- 
+  mixed(logrt ~ characters + music_condition * garden_path_cond * garden_path_type + 
+          (1|participant_id), df_crit, method = "KR")
+af_post_model <- 
+  mixed(logrt ~ characters + music_condition * garden_path_cond * garden_path_type + 
+          (1|participant_id), df_post, method = "KR")
+mean(df$Gold_MSI_index)
+
+af_pre_model
+af_crit_model
+af_post_model
+```
+
+
+
+
